@@ -169,9 +169,10 @@ prepare_server_dockerfile() {
   fi
 
   local tmp_dockerfile="$REPO_ROOT/.Dockerfile-server.cn-mirror.tmp"
-  # 仅替换第一行 FROM，避免改动原文件
+  # 仅替换第一个 FROM，避免改动原文件
   if ! awk -v new_from="FROM ${SERVER_BASE_IMAGE_CN}" '
-    NR==1 && $1=="FROM" { print new_from; next }
+    BEGIN { replaced=0 }
+    !replaced && $1=="FROM" { print new_from; replaced=1; next }
     { print }
   ' "$REPO_ROOT/Dockerfile-server" > "$tmp_dockerfile"; then
     warn "生成临时 Dockerfile 失败，回退使用原始 Dockerfile-server"
@@ -192,10 +193,11 @@ build_images() {
   prepare_server_dockerfile
 
   log "构建 server 镜像（本地代码）: $SERVER_IMAGE"
+  log "使用 Dockerfile: $SERVER_DOCKERFILE_BUILD"
   if [[ $NO_CACHE -eq 1 ]]; then
-    docker build --no-cache -t "$SERVER_IMAGE" -f "$SERVER_DOCKERFILE_BUILD" "$REPO_ROOT"
+    docker build --no-cache --pull=false -t "$SERVER_IMAGE" -f "$SERVER_DOCKERFILE_BUILD" "$REPO_ROOT"
   else
-    docker build -t "$SERVER_IMAGE" -f "$SERVER_DOCKERFILE_BUILD" "$REPO_ROOT"
+    docker build --pull=false -t "$SERVER_IMAGE" -f "$SERVER_DOCKERFILE_BUILD" "$REPO_ROOT"
   fi
 
   log "构建 web 镜像（本地代码）: $WEB_IMAGE"
