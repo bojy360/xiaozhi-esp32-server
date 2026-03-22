@@ -2,18 +2,21 @@
 set -euo pipefail
 
 # 本脚本用于：
-# 1) 使用本地源码构建 server/web 镜像
-# 2) 使用 docker compose 启动全模块（server + web + mysql + redis）
-# 3) 兼容 macOS / Ubuntu（不依赖 apt/systemctl/whiptail）
+# 1) build 模式：基于本地源码构建镜像并部署
+# 2) dev 模式：开发快速迭代（默认仅重启 server，不重建大镜像）
+# 3) 兼容 macOS / Ubuntu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$SCRIPT_DIR"
 STACK_DIR="$REPO_ROOT/main/xiaozhi-server"
+
 COMPOSE_BASE="$STACK_DIR/docker-compose_all.yml"
-COMPOSE_OVERRIDE="$STACK_DIR/.docker-compose.local-build.yml"
+COMPOSE_BUILD_OVERRIDE="$STACK_DIR/.docker-compose.local-build.yml"
+COMPOSE_DEV_OVERRIDE="$STACK_DIR/.docker-compose.local-dev.yml"
 
 SERVER_IMAGE="xiaozhi-esp32-server:server_local"
 WEB_IMAGE="xiaozhi-esp32-server:web_local"
+
 MODEL_PATH="$STACK_DIR/models/SenseVoiceSmall/model.pt"
 MODEL_URL="https://modelscope.cn/models/iic/SenseVoiceSmall/resolve/master/model.pt"
 
@@ -21,6 +24,12 @@ MODEL_URL="https://modelscope.cn/models/iic/SenseVoiceSmall/resolve/master/model
 USE_CN_MIRROR=1
 SERVER_BASE_IMAGE_CN="ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server-base"
 SERVER_DOCKERFILE_BUILD="$REPO_ROOT/Dockerfile-server"
+TEMP_SERVER_DOCKERFILE="$REPO_ROOT/.Dockerfile-server.cn-mirror.tmp"
+
+# mode: build|dev
+MODE="build"
+# target: server|all（build 默认 all，dev 默认 server）
+TARGET=""
 
 SKIP_BUILD=0
 SKIP_MODEL_DOWNLOAD=0
@@ -28,18 +37,33 @@ NO_CACHE=0
 ONLY_BUILD=0
 ONLY_UP=0
 DO_DOWN=0
+REBUILD=0
 
 usage() {
   cat <<'EOF'
 用法:
   ./docker-deploy-local.sh [选项]
 
-说明:
-  - 基于当前本地代码构建 Docker 镜像（不是拉远程 server/web 镜像）
-  - 适用于 macOS / Ubuntu
+模式:
+  --mode build|dev
+    - build: 本地构建镜像 + 部署
+    - dev: 开发快迭代（默认只处理 server，支持代码改完后快速重启）
+
+目标:
+  --target server|all
+    - build 模式默认 all
+    - dev 模式默认 server
+
+常用:
+  ./docker-deploy-local.sh --mode dev
+  ./docker-deploy-local.sh --mode dev --target server
+  ./docker-deploy-local.sh --mode build --down
 
 选项:
-  --skip-build            跳过镜像构建，只执行 compose up
+  --mode <build|dev>      运行模式（默认 build）
+  --target <server|all>   作用范围（默认: build=all, dev=server）
+  --skip-build            跳过镜像构建，只执行 up
+  --rebuild               强制重建镜像（dev 模式下默认不重建）
   --skip-model-download   若 model.pt 不存在也不下载
   --no-cache              构建镜像时加 --no-cache
   --only-build            只构建镜像，不启动容器
@@ -47,11 +71,6 @@ usage() {
   --down                  先执行 compose down 再 up
   --no-cn-mirror          关闭国内镜像替换（server 使用原始 Dockerfile FROM）
   -h, --help              查看帮助
-
-示例:
-  ./docker-deploy-local.sh
-  ./docker-deploy-local.sh --no-cache --down
-  ./docker-deploy-local.sh --only-build
 EOF
 }
 
@@ -76,7 +95,16 @@ compose_cmd() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --mode)
+        shift
+        MODE="${1:-}"
+        ;;
+      --target)
+        shift
+        TARGET="${1:-}"
+        ;;
       --skip-build) SKIP_BUILD=1 ;;
+      --rebuild) REBUILD=1 ;;
       --skip-model-download) SKIP_MODEL_DOWNLOAD=1 ;;
       --no-cache) NO_CACHE=1 ;;
       --only-build) ONLY_BUILD=1 ;;
@@ -93,6 +121,24 @@ parse_args() {
     shift
   done
 
+  case "$MODE" in
+    build|dev) ;;
+    *) err "--mode 仅支持 build|dev（当前: $MODE）"; exit 1 ;;
+  esac
+
+  if [[ -z "$TARGET" ]]; then
+    if [[ "$MODE" == "dev" ]]; then
+      TARGET="server"
+    else
+      TARGET="all"
+    fi
+  fi
+
+  case "$TARGET" in
+    server|all) ;;
+    *) err "--target 仅支持 server|all（当前: $TARGET）"; exit 1 ;;
+  esac
+
   if [[ $ONLY_BUILD -eq 1 && $ONLY_UP -eq 1 ]]; then
     err "--only-build 和 --only-up 不能同时使用"
     exit 1
@@ -104,10 +150,7 @@ check_env() {
   os="$(uname -s)"
   case "$os" in
     Darwin|Linux) ;;
-    *)
-      err "当前系统不支持: $os（仅支持 macOS / Linux）"
-      exit 1
-      ;;
+    *) err "当前系统不支持: $os（仅支持 macOS / Linux）"; exit 1 ;;
   esac
 
   if ! has_cmd docker; then
@@ -168,20 +211,46 @@ prepare_server_dockerfile() {
     return
   fi
 
-  local tmp_dockerfile="$REPO_ROOT/.Dockerfile-server.cn-mirror.tmp"
-  # 仅替换第一个 FROM，避免改动原文件
   if ! awk -v new_from="FROM ${SERVER_BASE_IMAGE_CN}" '
     BEGIN { replaced=0 }
     !replaced && $1=="FROM" { print new_from; replaced=1; next }
     { print }
-  ' "$REPO_ROOT/Dockerfile-server" > "$tmp_dockerfile"; then
+  ' "$REPO_ROOT/Dockerfile-server" > "$TEMP_SERVER_DOCKERFILE"; then
     warn "生成临时 Dockerfile 失败，回退使用原始 Dockerfile-server"
     SERVER_DOCKERFILE_BUILD="$REPO_ROOT/Dockerfile-server"
     return
   fi
 
-  SERVER_DOCKERFILE_BUILD="$tmp_dockerfile"
+  SERVER_DOCKERFILE_BUILD="$TEMP_SERVER_DOCKERFILE"
   log "server 构建基础镜像已切换到国内源: $SERVER_BASE_IMAGE_CN"
+}
+
+cleanup_temp_files() {
+  rm -f "$TEMP_SERVER_DOCKERFILE" || true
+}
+
+image_exists() {
+  docker image inspect "$1" >/dev/null 2>&1
+}
+
+build_server_image() {
+  prepare_server_dockerfile
+  log "构建 server 镜像（本地代码）: $SERVER_IMAGE"
+  log "使用 Dockerfile: $SERVER_DOCKERFILE_BUILD"
+  if [[ $NO_CACHE -eq 1 ]]; then
+    docker build --no-cache --pull=false -t "$SERVER_IMAGE" -f "$SERVER_DOCKERFILE_BUILD" "$REPO_ROOT"
+  else
+    docker build --pull=false -t "$SERVER_IMAGE" -f "$SERVER_DOCKERFILE_BUILD" "$REPO_ROOT"
+  fi
+}
+
+build_web_image() {
+  log "构建 web 镜像（本地代码）: $WEB_IMAGE"
+  if [[ $NO_CACHE -eq 1 ]]; then
+    docker build --no-cache -t "$WEB_IMAGE" -f "$REPO_ROOT/Dockerfile-web" "$REPO_ROOT"
+  else
+    docker build -t "$WEB_IMAGE" -f "$REPO_ROOT/Dockerfile-web" "$REPO_ROOT"
+  fi
 }
 
 build_images() {
@@ -190,36 +259,66 @@ build_images() {
     return
   fi
 
-  prepare_server_dockerfile
-
-  log "构建 server 镜像（本地代码）: $SERVER_IMAGE"
-  log "使用 Dockerfile: $SERVER_DOCKERFILE_BUILD"
-  if [[ $NO_CACHE -eq 1 ]]; then
-    docker build --no-cache --pull=false -t "$SERVER_IMAGE" -f "$SERVER_DOCKERFILE_BUILD" "$REPO_ROOT"
-  else
-    docker build --pull=false -t "$SERVER_IMAGE" -f "$SERVER_DOCKERFILE_BUILD" "$REPO_ROOT"
+  if [[ "$MODE" == "build" ]]; then
+    if [[ "$TARGET" == "all" ]]; then
+      build_server_image
+      build_web_image
+    else
+      build_server_image
+    fi
+    return
   fi
 
-  log "构建 web 镜像（本地代码）: $WEB_IMAGE"
-  if [[ $NO_CACHE -eq 1 ]]; then
-    docker build --no-cache -t "$WEB_IMAGE" -f "$REPO_ROOT/Dockerfile-web" "$REPO_ROOT"
+  # dev 模式：默认不重建，只有 --rebuild 或镜像不存在才构建
+  if [[ $REBUILD -eq 1 ]] || ! image_exists "$SERVER_IMAGE"; then
+    if ! image_exists "$SERVER_IMAGE"; then
+      warn "dev 模式下未找到本地 server 镜像，自动构建一次"
+    else
+      log "dev 模式收到 --rebuild，重建 server 镜像"
+    fi
+    build_server_image
   else
-    docker build -t "$WEB_IMAGE" -f "$REPO_ROOT/Dockerfile-web" "$REPO_ROOT"
+    log "dev 模式复用已有 server 镜像: $SERVER_IMAGE"
   fi
 
-  # 清理临时 Dockerfile
-  if [[ "$SERVER_DOCKERFILE_BUILD" == "$REPO_ROOT/.Dockerfile-server.cn-mirror.tmp" ]]; then
-    rm -f "$SERVER_DOCKERFILE_BUILD" || true
-    SERVER_DOCKERFILE_BUILD="$REPO_ROOT/Dockerfile-server"
+  if [[ "$TARGET" == "all" ]]; then
+    if [[ $REBUILD -eq 1 ]] || ! image_exists "$WEB_IMAGE"; then
+      if ! image_exists "$WEB_IMAGE"; then
+        warn "dev 模式下未找到本地 web 镜像，自动构建一次"
+      else
+        log "dev 模式收到 --rebuild，重建 web 镜像"
+      fi
+      build_web_image
+    else
+      log "dev 模式复用已有 web 镜像: $WEB_IMAGE"
+    fi
   fi
 }
 
-write_override_compose() {
-  cat > "$COMPOSE_OVERRIDE" <<EOF
+write_build_override_compose() {
+  cat > "$COMPOSE_BUILD_OVERRIDE" <<EOF
 services:
   xiaozhi-esp32-server:
     image: $SERVER_IMAGE
     pull_policy: never
+
+  xiaozhi-esp32-server-web:
+    image: $WEB_IMAGE
+    pull_policy: never
+EOF
+}
+
+write_dev_override_compose() {
+  cat > "$COMPOSE_DEV_OVERRIDE" <<EOF
+services:
+  xiaozhi-esp32-server:
+    image: $SERVER_IMAGE
+    pull_policy: never
+    command: ["python", "app.py"]
+    volumes:
+      - $STACK_DIR/data:/opt/xiaozhi-esp32-server/data
+      - $STACK_DIR/models/SenseVoiceSmall/model.pt:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall/model.pt
+      - $REPO_ROOT/main/xiaozhi-server:/opt/xiaozhi-esp32-server
 
   xiaozhi-esp32-server-web:
     image: $WEB_IMAGE
@@ -233,17 +332,28 @@ deploy_stack() {
     return
   fi
 
-  write_override_compose
+  write_build_override_compose
+
+  local compose_args=( -f "$COMPOSE_BASE" -f "$COMPOSE_BUILD_OVERRIDE" )
+  if [[ "$MODE" == "dev" ]]; then
+    write_dev_override_compose
+    compose_args+=( -f "$COMPOSE_DEV_OVERRIDE" )
+  fi
 
   if [[ $DO_DOWN -eq 1 ]]; then
     log "执行 down 清理旧容器..."
-    (cd "$STACK_DIR" && $COMPOSE_BIN -f "$COMPOSE_BASE" -f "$COMPOSE_OVERRIDE" down)
+    (cd "$STACK_DIR" && $COMPOSE_BIN "${compose_args[@]}" down)
   fi
 
-  log "启动容器（使用本地构建镜像）..."
-  (cd "$STACK_DIR" && $COMPOSE_BIN -f "$COMPOSE_BASE" -f "$COMPOSE_OVERRIDE" up -d --remove-orphans)
+  if [[ "$MODE" == "dev" && "$TARGET" == "server" ]]; then
+    log "dev 模式：仅更新 server 容器（不影响 db/redis/web）..."
+    (cd "$STACK_DIR" && $COMPOSE_BIN "${compose_args[@]}" up -d --no-deps xiaozhi-esp32-server)
+  else
+    log "启动容器..."
+    (cd "$STACK_DIR" && $COMPOSE_BIN "${compose_args[@]}" up -d --remove-orphans)
+  fi
 
-  log "部署完成。"
+  log "部署完成（mode=$MODE, target=$TARGET）"
   echo
   echo "管理后台:  http://127.0.0.1:8002"
   echo "WS 地址:    ws://127.0.0.1:8000/xiaozhi/v1/"
@@ -253,11 +363,17 @@ deploy_stack() {
   echo "  docker logs -f xiaozhi-esp32-server-web"
   echo "  docker logs -f xiaozhi-esp32-server"
   echo
+  if [[ "$MODE" == "dev" ]]; then
+    echo "dev 模式提示：改完 Python 代码后执行以下命令即可快速生效（无需重建镜像）："
+    echo "  docker restart xiaozhi-esp32-server"
+    echo
+  fi
   echo "若首次部署，请在智控台参数管理里确认 server.secret，并同步到:"
   echo "  $STACK_DIR/data/.config.yaml"
 }
 
 main() {
+  trap cleanup_temp_files EXIT
   parse_args "$@"
   check_env
   prepare_dirs_and_files
