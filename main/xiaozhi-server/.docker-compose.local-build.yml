@@ -1,0 +1,8 @@
+services:
+  xiaozhi-esp32-server:
+    image: xiaozhi-esp32-server:server_local
+    pull_policy: never
+
+  xiaozhi-esp32-server-web:
+    image: xiaozhi-esp32-server:web_local
+    pull_policy: never
