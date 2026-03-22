@@ -17,6 +17,11 @@ WEB_IMAGE="xiaozhi-esp32-server:web_local"
 MODEL_PATH="$STACK_DIR/models/SenseVoiceSmall/model.pt"
 MODEL_URL="https://modelscope.cn/models/iic/SenseVoiceSmall/resolve/master/model.pt"
 
+# 国内镜像配置（默认启用）
+USE_CN_MIRROR=1
+SERVER_BASE_IMAGE_CN="ghcr.nju.edu.cn/xinnan-tech/xiaozhi-esp32-server:server-base"
+SERVER_DOCKERFILE_BUILD="$REPO_ROOT/Dockerfile-server"
+
 SKIP_BUILD=0
 SKIP_MODEL_DOWNLOAD=0
 NO_CACHE=0
@@ -40,6 +45,7 @@ usage() {
   --only-build            只构建镜像，不启动容器
   --only-up               只启动容器（等同于 --skip-build）
   --down                  先执行 compose down 再 up
+  --no-cn-mirror          关闭国内镜像替换（server 使用原始 Dockerfile FROM）
   -h, --help              查看帮助
 
 示例:
@@ -76,6 +82,7 @@ parse_args() {
       --only-build) ONLY_BUILD=1 ;;
       --only-up) ONLY_UP=1; SKIP_BUILD=1 ;;
       --down) DO_DOWN=1 ;;
+      --no-cn-mirror) USE_CN_MIRROR=0 ;;
       -h|--help) usage; exit 0 ;;
       *)
         err "未知参数: $1"
@@ -153,17 +160,42 @@ prepare_dirs_and_files() {
   fi
 }
 
+prepare_server_dockerfile() {
+  SERVER_DOCKERFILE_BUILD="$REPO_ROOT/Dockerfile-server"
+
+  if [[ $USE_CN_MIRROR -eq 0 ]]; then
+    log "server 构建使用默认基础镜像（未启用国内镜像替换）"
+    return
+  fi
+
+  local tmp_dockerfile="$REPO_ROOT/.Dockerfile-server.cn-mirror.tmp"
+  # 仅替换第一行 FROM，避免改动原文件
+  if ! awk -v new_from="FROM ${SERVER_BASE_IMAGE_CN}" '
+    NR==1 && $1=="FROM" { print new_from; next }
+    { print }
+  ' "$REPO_ROOT/Dockerfile-server" > "$tmp_dockerfile"; then
+    warn "生成临时 Dockerfile 失败，回退使用原始 Dockerfile-server"
+    SERVER_DOCKERFILE_BUILD="$REPO_ROOT/Dockerfile-server"
+    return
+  fi
+
+  SERVER_DOCKERFILE_BUILD="$tmp_dockerfile"
+  log "server 构建基础镜像已切换到国内源: $SERVER_BASE_IMAGE_CN"
+}
+
 build_images() {
   if [[ $SKIP_BUILD -eq 1 ]]; then
     log "跳过镜像构建"
     return
   fi
 
+  prepare_server_dockerfile
+
   log "构建 server 镜像（本地代码）: $SERVER_IMAGE"
   if [[ $NO_CACHE -eq 1 ]]; then
-    docker build --no-cache -t "$SERVER_IMAGE" -f "$REPO_ROOT/Dockerfile-server" "$REPO_ROOT"
+    docker build --no-cache -t "$SERVER_IMAGE" -f "$SERVER_DOCKERFILE_BUILD" "$REPO_ROOT"
   else
-    docker build -t "$SERVER_IMAGE" -f "$REPO_ROOT/Dockerfile-server" "$REPO_ROOT"
+    docker build -t "$SERVER_IMAGE" -f "$SERVER_DOCKERFILE_BUILD" "$REPO_ROOT"
   fi
 
   log "构建 web 镜像（本地代码）: $WEB_IMAGE"
@@ -171,6 +203,12 @@ build_images() {
     docker build --no-cache -t "$WEB_IMAGE" -f "$REPO_ROOT/Dockerfile-web" "$REPO_ROOT"
   else
     docker build -t "$WEB_IMAGE" -f "$REPO_ROOT/Dockerfile-web" "$REPO_ROOT"
+  fi
+
+  # 清理临时 Dockerfile
+  if [[ "$SERVER_DOCKERFILE_BUILD" == "$REPO_ROOT/.Dockerfile-server.cn-mirror.tmp" ]]; then
+    rm -f "$SERVER_DOCKERFILE_BUILD" || true
+    SERVER_DOCKERFILE_BUILD="$REPO_ROOT/Dockerfile-server"
   fi
 }
 
