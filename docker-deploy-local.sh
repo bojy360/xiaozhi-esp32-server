@@ -353,7 +353,7 @@ deploy_stack() {
     (cd "$STACK_DIR" && $COMPOSE_BIN "${compose_args[@]}" up -d --remove-orphans)
   fi
 
-  log "部署完成（mode=$MODE, target=$TARGET）"
+  log "部署完成（mode=${MODE:-build}, target=${TARGET:-server}）"
   echo
   echo "管理后台:  http://127.0.0.1:8002"
   echo "WS 地址:    ws://127.0.0.1:8000/xiaozhi/v1/"

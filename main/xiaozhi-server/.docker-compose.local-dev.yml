@@ -1,0 +1,13 @@
+services:
+  xiaozhi-esp32-server:
+    image: xiaozhi-esp32-server:server_local
+    pull_policy: never
+    command: ["python", "app.py"]
+    volumes:
+      - /Users/boyu/Desktop/code/xiaozhi-esp32-server/main/xiaozhi-server/data:/opt/xiaozhi-esp32-server/data
+      - /Users/boyu/Desktop/code/xiaozhi-esp32-server/main/xiaozhi-server/models/SenseVoiceSmall/model.pt:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall/model.pt
+      - /Users/boyu/Desktop/code/xiaozhi-esp32-server/main/xiaozhi-server:/opt/xiaozhi-esp32-server
+
+  xiaozhi-esp32-server-web:
+    image: xiaozhi-esp32-server:web_local
+    pull_policy: never
